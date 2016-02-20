@@ -1,0 +1,213 @@
+diff --git a/src/backend/parser/parse_func.c b/src/backend/parser/parse_func.c
+index a200804..e0a0980 100644
+--- a/src/backend/parser/parse_func.c
++++ b/src/backend/parser/parse_func.c
+@@ -93,6 +93,7 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
+ 	Oid			vatype;
+ 	FuncDetailCode fdresult;
+ 	char		aggkind = 0;
++	ParseCallbackState pcbstate;
+ 
+ 	/*
+ 	 * If there's an aggregate filter, transform it using transformWhereClause
+@@ -235,12 +236,18 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
+ 	 * type.  We'll fix up the variadic case below.  We may also have to deal
+ 	 * with default arguments.
+ 	 */
++
++	setup_parser_errposition_callback(&pcbstate, pstate, location);
++
+ 	fdresult = func_get_detail(funcname, fargs, argnames, nargs,
+ 							   actual_arg_types,
+ 							   !func_variadic, true,
+ 							   &funcid, &rettype, &retset,
+ 							   &nvargs, &vatype,
+ 							   &declared_arg_types, &argdefaults);
++
++	cancel_parser_errposition_callback(&pcbstate);
++
+ 	if (fdresult == FUNCDETAIL_COERCION)
+ 	{
+ 		/*
+diff --git a/src/backend/parser/parse_oper.c b/src/backend/parser/parse_oper.c
+index 10de97b..0e2b228 100644
+--- a/src/backend/parser/parse_oper.c
++++ b/src/backend/parser/parse_oper.c
+@@ -379,11 +379,17 @@ oper(ParseState *pstate, List *opname, Oid ltypeId, Oid rtypeId,
+ 	bool		key_ok;
+ 	FuncDetailCode fdresult = FUNCDETAIL_NOTFOUND;
+ 	HeapTuple	tup = NULL;
++	ParseCallbackState pcbstate;
+ 
+ 	/*
+-	 * Try to find the mapping in the lookaside cache.
++	 * Try to find the mapping in the lookaside cache. since this call will 
++	 * fail if the operator is schema-qualified and the schema does not exist,
++	 * we will not check again below (e.g., around OpernameGetCandidates).
+ 	 */
++	setup_parser_errposition_callback(&pcbstate, pstate, location);
+ 	key_ok = make_oper_cache_key(&key, opname, ltypeId, rtypeId);
++	cancel_parser_errposition_callback(&pcbstate);
++
+ 	if (key_ok)
+ 	{
+ 		operOid = find_oper_cache_entry(&key);
+@@ -525,11 +531,17 @@ right_oper(ParseState *pstate, List *op, Oid arg, bool noError, int location)
+ 	bool		key_ok;
+ 	FuncDetailCode fdresult = FUNCDETAIL_NOTFOUND;
+ 	HeapTuple	tup = NULL;
++	ParseCallbackState pcbstate;
+ 
+ 	/*
+-	 * Try to find the mapping in the lookaside cache.
++	 * Try to find the mapping in the lookaside cache. since this call will 
++	 * fail if the operator is schema-qualified and the schema does not exist,
++	 * we will not check again below (e.g., around OpernameGetCandidates).
+ 	 */
++	setup_parser_errposition_callback(&pcbstate, pstate, location);
+ 	key_ok = make_oper_cache_key(&key, op, arg, InvalidOid);
++	cancel_parser_errposition_callback(&pcbstate);
++
+ 	if (key_ok)
+ 	{
+ 		operOid = find_oper_cache_entry(&key);
+@@ -603,11 +615,17 @@ left_oper(ParseState *pstate, List *op, Oid arg, bool noError, int location)
+ 	bool		key_ok;
+ 	FuncDetailCode fdresult = FUNCDETAIL_NOTFOUND;
+ 	HeapTuple	tup = NULL;
++	ParseCallbackState pcbstate;
+ 
+ 	/*
+-	 * Try to find the mapping in the lookaside cache.
++	 * Try to find the mapping in the lookaside cache. since this call will 
++	 * fail if the operator is schema-qualified and the schema does not exist,
++	 * we will not check again below (e.g., around OpernameGetCandidates).
+ 	 */
++	setup_parser_errposition_callback(&pcbstate, pstate, location);
+ 	key_ok = make_oper_cache_key(&key, op, InvalidOid, arg);
++	cancel_parser_errposition_callback(&pcbstate);
++
+ 	if (key_ok)
+ 	{
+ 		operOid = find_oper_cache_entry(&key);
+diff --git a/src/backend/parser/parse_type.c b/src/backend/parser/parse_type.c
+index ca5fbed..1ba6ca7 100644
+--- a/src/backend/parser/parse_type.c
++++ b/src/backend/parser/parse_type.c
+@@ -156,6 +156,9 @@ LookupTypeName(ParseState *pstate, const TypeName *typeName,
+ 		{
+ 			/* Look in specific schema only */
+ 			Oid			namespaceId;
++			ParseCallbackState pcbstate;
++
++			setup_parser_errposition_callback(&pcbstate, pstate, typeName->location);
+ 
+ 			namespaceId = LookupExplicitNamespace(schemaname, missing_ok);
+ 			if (OidIsValid(namespaceId))
+@@ -164,6 +167,8 @@ LookupTypeName(ParseState *pstate, const TypeName *typeName,
+ 										 ObjectIdGetDatum(namespaceId));
+ 			else
+ 				typoid = InvalidOid;
++
++			cancel_parser_errposition_callback(&pcbstate);
+ 		}
+ 		else
+ 		{
+diff --git a/src/backend/parser/parse_utilcmd.c b/src/backend/parser/parse_utilcmd.c
+index 3ccdbb7..6098be4 100644
+--- a/src/backend/parser/parse_utilcmd.c
++++ b/src/backend/parser/parse_utilcmd.c
+@@ -149,6 +149,7 @@ transformCreateStmt(CreateStmt *stmt, const char *queryString)
+ 	ListCell   *elements;
+ 	Oid			namespaceid;
+ 	Oid			existing_relid;
++	ParseCallbackState pcbstate;
+ 
+ 	/*
+ 	 * We must not scribble on the passed-in CreateStmt, so copy it.  (This is
+@@ -156,40 +157,6 @@ transformCreateStmt(CreateStmt *stmt, const char *queryString)
+ 	 */
+ 	stmt = (CreateStmt *) copyObject(stmt);
+ 
+-	/*
+-	 * Look up the creation namespace.  This also checks permissions on the
+-	 * target namespace, locks it against concurrent drops, checks for a
+-	 * preexisting relation in that namespace with the same name, and updates
+-	 * stmt->relation->relpersistence if the select namespace is temporary.
+-	 */
+-	namespaceid =
+-		RangeVarGetAndCheckCreationNamespace(stmt->relation, NoLock,
+-											 &existing_relid);
+-
+-	/*
+-	 * If the relation already exists and the user specified "IF NOT EXISTS",
+-	 * bail out with a NOTICE.
+-	 */
+-	if (stmt->if_not_exists && OidIsValid(existing_relid))
+-	{
+-		ereport(NOTICE,
+-				(errcode(ERRCODE_DUPLICATE_TABLE),
+-				 errmsg("relation \"%s\" already exists, skipping",
+-						stmt->relation->relname)));
+-		return NIL;
+-	}
+-
+-	/*
+-	 * If the target relation name isn't schema-qualified, make it so.  This
+-	 * prevents some corner cases in which added-on rewritten commands might
+-	 * think they should apply to other relations that have the same name and
+-	 * are earlier in the search path.  But a local temp table is effectively
+-	 * specified to be in pg_temp, so no need for anything extra in that case.
+-	 */
+-	if (stmt->relation->schemaname == NULL
+-		&& stmt->relation->relpersistence != RELPERSISTENCE_TEMP)
+-		stmt->relation->schemaname = get_namespace_name(namespaceid);
+-
+ 	/* Set up pstate and CreateStmtContext */
+ 	pstate = make_parsestate(NULL);
+ 	pstate->p_sourcetext = queryString;
+@@ -225,6 +192,44 @@ transformCreateStmt(CreateStmt *stmt, const char *queryString)
+ 		transformOfType(&cxt, stmt->ofTypename);
+ 
+ 	/*
++	 * Look up the creation namespace.  This also checks permissions on the
++	 * target namespace, locks it against concurrent drops, checks for a
++	 * preexisting relation in that namespace with the same name, and updates
++	 * stmt->relation->relpersistence if the select namespace is temporary.
++	 */
++	setup_parser_errposition_callback(&pcbstate, pstate, stmt->relation->location);
++
++	namespaceid =
++		RangeVarGetAndCheckCreationNamespace(stmt->relation, NoLock,
++											 &existing_relid);
++
++	cancel_parser_errposition_callback(&pcbstate);
++
++	/*
++	 * If the relation already exists and the user specified "IF NOT EXISTS",
++	 * bail out with a NOTICE.
++	 */
++	if (stmt->if_not_exists && OidIsValid(existing_relid))
++	{
++		ereport(NOTICE,
++				(errcode(ERRCODE_DUPLICATE_TABLE),
++				 errmsg("relation \"%s\" already exists, skipping",
++						stmt->relation->relname)));
++		return NIL;
++	}
++
++	/*
++	 * If the target relation name isn't schema-qualified, make it so.  This
++	 * prevents some corner cases in which added-on rewritten commands might
++	 * think they should apply to other relations that have the same name and
++	 * are earlier in the search path.  But a local temp table is effectively
++	 * specified to be in pg_temp, so no need for anything extra in that case.
++	 */
++	if (stmt->relation->schemaname == NULL
++		&& stmt->relation->relpersistence != RELPERSISTENCE_TEMP)
++		stmt->relation->schemaname = get_namespace_name(namespaceid);
++
++	/*
+ 	 * Run through each primary element in the table creation clause. Separate
+ 	 * column defs from constraints, and do preliminary analysis.
+ 	 */

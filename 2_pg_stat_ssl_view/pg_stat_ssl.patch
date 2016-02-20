@@ -1,0 +1,436 @@
+*** a/src/backend/catalog/system_views.sql
+--- b/src/backend/catalog/system_views.sql
+***************
+*** 648,653 **** CREATE VIEW pg_stat_replication AS
+--- 648,664 ----
+      WHERE S.usesysid = U.oid AND
+              S.pid = W.pid;
+  
++ CREATE VIEW pg_stat_ssl AS
++     SELECT
++             I.pid,
++             I.ssl,
++             I.bits,
++             I.compression,
++             I.version,
++             I.cipher,
++             I.clientdn
++     FROM pg_stat_get_sslstatus() AS I;
++ 
+  CREATE VIEW pg_replication_slots AS
+      SELECT
+              L.slot_name,
+*** a/src/backend/libpq/be-secure-openssl.c
+--- b/src/backend/libpq/be-secure-openssl.c
+***************
+*** 88,93 **** static void info_cb(const SSL *ssl, int type, int args);
+--- 88,95 ----
+  static void initialize_ecdh(void);
+  static const char *SSLerrmessage(void);
+  
++ static char *X509_NAME_to_cstring(X509_NAME *name);
++ 
+  /* are we in the middle of a renegotiation? */
+  static bool in_ssl_renegotiation = false;
+  
+***************
+*** 1053,1055 **** SSLerrmessage(void)
+--- 1055,1159 ----
+  	snprintf(errbuf, sizeof(errbuf), _("SSL error code %lu"), errcode);
+  	return errbuf;
+  }
++ 
++ /*
++  * Return information about the SSL connection
++  */
++ int
++ be_tls_get_cipher_bits(Port *port)
++ {
++ 	int bits;
++ 
++ 	if (port->ssl)
++ 	{
++ 		SSL_get_cipher_bits(port->ssl, &bits);
++ 		return bits;
++ 	}
++ 	else
++ 		return 0;
++ }
++ 
++ bool
++ be_tls_get_compression(Port *port)
++ {
++ 	if (port->ssl)
++ 		return (SSL_get_current_compression(port->ssl) != NULL);
++ 	else
++ 		return false;
++ }
++ 
++ void
++ be_tls_get_version(Port *port, char *ptr, size_t len)
++ {
++ 	if (port->ssl)
++ 		strlcpy(ptr, SSL_get_version(port->ssl), len);
++ 	else
++ 		ptr[0] = '\0';
++ }
++ 
++ void
++ be_tls_get_cipher(Port *port, char *ptr, size_t len)
++ {
++ 	if (port->ssl)
++ 		strlcpy(ptr, SSL_get_cipher(port->ssl), NAMEDATALEN);
++ 	else
++ 		ptr[0] = '\0';
++ }
++ 
++ void
++ be_tls_get_peerdn_name(Port *port, char *ptr, size_t len)
++ {
++ 	if (port->peer)
++ 		strlcpy(ptr, X509_NAME_to_cstring(X509_get_subject_name(port->peer)), NAMEDATALEN);
++ 	else
++ 		ptr[0] = '\0';
++ }
++ 
++ /*
++  * Convert an X509 subject name to a cstring.
++  *
++  */
++ static char *
++ X509_NAME_to_cstring(X509_NAME *name)
++ {
++ 	BIO		   *membuf = BIO_new(BIO_s_mem());
++ 	int			i,
++ 				nid,
++ 				count = X509_NAME_entry_count(name);
++ 	X509_NAME_ENTRY *e;
++ 	ASN1_STRING *v;
++ 	const char *field_name;
++ 	size_t		size;
++ 	char		nullterm;
++ 	char	   *sp;
++ 	char	   *dp;
++ 	char	   *result;
++ 
++ 	(void) BIO_set_close(membuf, BIO_CLOSE);
++ 	for (i = 0; i < count; i++)
++ 	{
++ 		e = X509_NAME_get_entry(name, i);
++ 		nid = OBJ_obj2nid(X509_NAME_ENTRY_get_object(e));
++ 		v = X509_NAME_ENTRY_get_data(e);
++ 		field_name = OBJ_nid2sn(nid);
++ 		if (!field_name)
++ 			field_name = OBJ_nid2ln(nid);
++ 		BIO_printf(membuf, "/%s=", field_name);
++ 		ASN1_STRING_print_ex(membuf, v,
++ 							 ((ASN1_STRFLGS_RFC2253 & ~ASN1_STRFLGS_ESC_MSB)
++ 							  | ASN1_STRFLGS_UTF8_CONVERT));
++ 	}
++ 
++ 	/* ensure null termination of the BIO's content */
++ 	nullterm = '\0';
++ 	BIO_write(membuf, &nullterm, 1);
++ 	size = BIO_get_mem_data(membuf, &sp);
++ 	dp = pg_any_to_server(sp, size - 1, PG_UTF8);
++ 
++ 	result = pstrdup(dp);
++ 	if (dp != sp)
++ 		pfree(dp);
++ 	BIO_free(membuf);
++ 
++ 	return result;
++ }
+*** a/src/backend/postmaster/pgstat.c
+--- b/src/backend/postmaster/pgstat.c
+***************
+*** 2386,2391 **** pgstat_fetch_global(void)
+--- 2386,2394 ----
+  static PgBackendStatus *BackendStatusArray = NULL;
+  static PgBackendStatus *MyBEEntry = NULL;
+  static char *BackendClientHostnameBuffer = NULL;
++ static char *BackendSslVersionBuffer = NULL;
++ static char *BackendSslCipherBuffer = NULL;
++ static char *BackendSslClientDNBuffer = NULL;
+  static char *BackendAppnameBuffer = NULL;
+  static char *BackendActivityBuffer = NULL;
+  static Size BackendActivityBufferSize = 0;
+***************
+*** 2470,2475 **** CreateSharedBackendStatus(void)
+--- 2473,2531 ----
+  		}
+  	}
+  
++ 	/* Create or attach to the shared SSL status buffers */
++ 	size = mul_size(NAMEDATALEN, MaxBackends);
++ 	BackendSslVersionBuffer = (char *)
++ 		ShmemInitStruct("Backend SSL Version Buffer", size, &found);
++ 
++ 	if (!found)
++ 	{
++ 		MemSet(BackendSslVersionBuffer, 0, size);
++ 
++ 		/* Initialize st_ssl_version pointers. */
++ 		buffer = BackendSslVersionBuffer;
++ 		for (i = 0; i < MaxBackends; i++)
++ 		{
++ 			BackendStatusArray[i].st_ssl_version = buffer;
++ 			buffer += NAMEDATALEN;
++ 		}
++ 	}
++ 
++ 	size = mul_size(NAMEDATALEN, MaxBackends);
++ 	BackendSslCipherBuffer = (char *)
++ 		ShmemInitStruct("Backend SSL Cipher Buffer", size, &found);
++ 
++ 	if (!found)
++ 	{
++ 		MemSet(BackendSslCipherBuffer, 0, size);
++ 
++ 		/* Initialize st_ssl_cipher pointers. */
++ 		buffer = BackendSslCipherBuffer;
++ 		for (i = 0; i < MaxBackends; i++)
++ 		{
++ 			BackendStatusArray[i].st_ssl_cipher = buffer;
++ 			buffer += NAMEDATALEN;
++ 		}
++ 	}
++ 
++ 	size = mul_size(NAMEDATALEN, MaxBackends);
++ 	BackendSslClientDNBuffer = (char *)
++ 		ShmemInitStruct("Backend SSL Client DN Buffer", size, &found);
++ 
++ 	if (!found)
++ 	{
++ 		MemSet(BackendSslClientDNBuffer, 0, size);
++ 
++ 		/* Initialize st_ssl_clientdn pointers. */
++ 		buffer = BackendSslClientDNBuffer;
++ 		for (i = 0; i < MaxBackends; i++)
++ 		{
++ 			BackendStatusArray[i].st_ssl_clientdn = buffer;
++ 			buffer += NAMEDATALEN;
++ 		}
++ 	}
++ 
++ 
+  	/* Create or attach to the shared activity buffer */
+  	BackendActivityBufferSize = mul_size(pgstat_track_activity_query_size,
+  										 MaxBackends);
+***************
+*** 2579,2584 **** pgstat_bestart(void)
+--- 2635,2653 ----
+  				NAMEDATALEN);
+  	else
+  		beentry->st_clienthostname[0] = '\0';
++ #ifdef USE_SSL
++ 	beentry->st_ssl = (MyProcPort && MyProcPort->ssl != NULL);
++ 	if (beentry->st_ssl)
++ 	{
++ 		beentry->st_ssl_bits = be_tls_get_cipher_bits(MyProcPort);
++ 		beentry->st_ssl_compression = be_tls_get_compression(MyProcPort);
++ 		be_tls_get_version(MyProcPort, beentry->st_ssl_version, NAMEDATALEN);
++ 		be_tls_get_cipher(MyProcPort, beentry->st_ssl_cipher, NAMEDATALEN);
++ 		be_tls_get_peerdn_name(MyProcPort, beentry->st_ssl_clientdn, NAMEDATALEN);
++ 	}
++ #else
++ 	beentry->st_ssl = false;
++ #endif
+  	beentry->st_waiting = false;
+  	beentry->st_state = STATE_UNDEFINED;
+  	beentry->st_appname[0] = '\0';
+***************
+*** 2806,2811 **** pgstat_read_current_status(void)
+--- 2875,2883 ----
+  	LocalPgBackendStatus *localtable;
+  	LocalPgBackendStatus *localentry;
+  	char	   *localappname,
++ 			   *localsslversion,
++ 			   *localsslcipher,
++ 			   *localsslclientdn,
+  			   *localactivity;
+  	int			i;
+  
+***************
+*** 2821,2826 **** pgstat_read_current_status(void)
+--- 2893,2907 ----
+  	localappname = (char *)
+  		MemoryContextAlloc(pgStatLocalContext,
+  						   NAMEDATALEN * MaxBackends);
++ 	localsslversion = (char *)
++ 		MemoryContextAlloc(pgStatLocalContext,
++ 						   NAMEDATALEN * MaxBackends);
++ 	localsslcipher = (char *)
++ 		MemoryContextAlloc(pgStatLocalContext,
++ 						   NAMEDATALEN * MaxBackends);
++ 	localsslclientdn = (char *)
++ 		MemoryContextAlloc(pgStatLocalContext,
++ 						   NAMEDATALEN * MaxBackends);
+  	localactivity = (char *)
+  		MemoryContextAlloc(pgStatLocalContext,
+  						   pgstat_track_activity_query_size * MaxBackends);
+***************
+*** 2854,2859 **** pgstat_read_current_status(void)
+--- 2935,2946 ----
+  				localentry->backendStatus.st_appname = localappname;
+  				strcpy(localactivity, (char *) beentry->st_activity);
+  				localentry->backendStatus.st_activity = localactivity;
++ 				strcpy(localsslversion, (char *) beentry->st_ssl_version);
++ 				localentry->backendStatus.st_ssl_version = localsslversion;
++ 				strcpy(localsslcipher, (char *) beentry->st_ssl_cipher);
++ 				localentry->backendStatus.st_ssl_cipher = localsslcipher;
++ 				strcpy(localsslclientdn, (char *) beentry->st_ssl_clientdn);
++ 				localentry->backendStatus.st_ssl_clientdn = localsslclientdn;
+  			}
+  
+  			if (save_changecount == beentry->st_changecount &&
+***************
+*** 2874,2879 **** pgstat_read_current_status(void)
+--- 2961,2969 ----
+  
+  			localentry++;
+  			localappname += NAMEDATALEN;
++ 			localsslversion += NAMEDATALEN;
++ 			localsslcipher += NAMEDATALEN;
++ 			localsslclientdn += NAMEDATALEN;
+  			localactivity += pgstat_track_activity_query_size;
+  			localNumBackends++;
+  		}
+*** a/src/backend/utils/adt/pgstatfuncs.c
+--- b/src/backend/utils/adt/pgstatfuncs.c
+***************
+*** 821,826 **** pg_stat_get_activity(PG_FUNCTION_ARGS)
+--- 821,905 ----
+  	}
+  }
+  
++ /*
++  * Returns SSL information for all connections, both regular backend and
++  * WAL senders.
++  */
++ Datum
++ pg_stat_get_sslstatus(PG_FUNCTION_ARGS)
++ {
++ #define PG_STAT_GET_SSLSTATUS_COLS 7
++ 	ReturnSetInfo  *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
++ 	TupleDesc		tupdesc;
++ 	Tuplestorestate *tupstore;
++ 	MemoryContext	per_query_ctx;
++ 	MemoryContext	oldcontext;
++ 	int				i;
++ 
++ 	/* check to see if caller supports us returning a tuplestore */
++ 	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
++ 		ereport(ERROR,
++ 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++ 				 errmsg("set-valued function called in context that cannot accept a set")));
++ 	if (!(rsinfo->allowedModes & SFRM_Materialize))
++ 		ereport(ERROR,
++ 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++ 				 errmsg("materialize mode required, but it is not "		\
++ 						"allowed in this context")));
++ 
++ 	/* Build a tuple descriptor for our result type */
++ 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
++ 		elog(ERROR, "return type must be a row type");
++ 
++ 	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
++ 	oldcontext = MemoryContextSwitchTo(per_query_ctx);
++ 
++ 	tupstore = tuplestore_begin_heap(true, false, work_mem);
++ 	rsinfo->returnMode = SFRM_Materialize;
++ 	rsinfo->setResult = tupstore;
++ 	rsinfo->setDesc = tupdesc;
++ 
++ 	MemoryContextSwitchTo(oldcontext);
++ 
++ 	for (i = 0; i < pgstat_fetch_stat_numbackends(); i++)
++ 	{
++ 		Datum			values[PG_STAT_GET_SSLSTATUS_COLS];
++ 		bool			nulls[PG_STAT_GET_SSLSTATUS_COLS];
++ 		PgBackendStatus *beentry = &pgstat_fetch_stat_local_beentry(i+1)->backendStatus;
++ 
++ 		if (beentry->st_procpid == 0)
++ 			continue;
++ 
++ 		MemSet(nulls, 0, sizeof(nulls));
++ 		/* XXX: somethign superuser only? */
++ 
++ 		values[0] = Int32GetDatum(beentry->st_procpid);
++ 		values[1] = BoolGetDatum(beentry->st_ssl);
++ 		if (beentry->st_ssl)
++ 		{
++ 			values[2] = Int32GetDatum(beentry->st_ssl_bits);
++ 			values[3] = BoolGetDatum(beentry->st_ssl_compression);
++ 			values[4] = CStringGetTextDatum(beentry->st_ssl_version);
++ 			values[5] = CStringGetTextDatum(beentry->st_ssl_cipher);
++ 			values[6] = CStringGetTextDatum(beentry->st_ssl_clientdn);
++ 		}
++ 		else
++ 		{
++ 			nulls[2] = true; /* bits */
++ 			nulls[3] = true; /* compression */
++ 			nulls[4] = true; /* version */
++ 			nulls[5] = true; /* cipher */
++ 			nulls[6] = true; /* clientdn */
++ 		}
++ 
++ 		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
++ 	}
++ 
++ 	/* clean up and return the tuplestore */
++ 	tuplestore_donestoring(tupstore);
++ 
++ 	return (Datum) 0;
++ }
+  
+  Datum
+  pg_backend_pid(PG_FUNCTION_ARGS)
+*** a/src/include/catalog/pg_proc.h
+--- b/src/include/catalog/pg_proc.h
+***************
+*** 2693,2698 **** DATA(insert OID = 2022 (  pg_stat_get_activity			PGNSP PGUID 12 1 100 0 0 f f f
+--- 2693,2700 ----
+  DESCR("statistics: information about currently active backends");
+  DATA(insert OID = 3099 (  pg_stat_get_wal_senders	PGNSP PGUID 12 1 10 0 0 f f f f f t s 0 0 2249 "" "{23,25,3220,3220,3220,3220,23,25}" "{o,o,o,o,o,o,o,o}" "{pid,state,sent_location,write_location,flush_location,replay_location,sync_priority,sync_state}" _null_ pg_stat_get_wal_senders _null_ _null_ _null_ ));
+  DESCR("statistics: information about currently active replication");
++ DATA(insert OID = 3259 ( pg_stat_get_sslstatus	PGNSP PGUID 12 1 10 0 0 f f f f f t s 0 0 2249 "" "{23,16,23,16,25,25,25}" "{o,o,o,o,o,o,o}" "{pid,ssl,bits,compression,version,cipher,clientdn}" _null_ pg_stat_get_sslstatus _null_ _null_ _null_ ));
++ DESCR("statistics: information about SSL connections");
+  DATA(insert OID = 2026 (  pg_backend_pid				PGNSP PGUID 12 1 0 0 0 f f f f t f s 0 0 23 "" _null_ _null_ _null_ _null_ pg_backend_pid _null_ _null_ _null_ ));
+  DESCR("statistics: current backend PID");
+  DATA(insert OID = 1937 (  pg_stat_get_backend_pid		PGNSP PGUID 12 1 0 0 0 f f f f t f s 1 0 23 "23" _null_ _null_ _null_ _null_ pg_stat_get_backend_pid _null_ _null_ _null_ ));
+*** a/src/include/libpq/libpq-be.h
+--- b/src/include/libpq/libpq-be.h
+***************
+*** 210,215 **** extern void be_tls_close(Port *port);
+--- 210,220 ----
+  extern ssize_t be_tls_read(Port *port, void *ptr, size_t len);
+  extern ssize_t be_tls_write(Port *port, void *ptr, size_t len);
+  
++ extern int be_tls_get_cipher_bits(Port *port);
++ extern bool be_tls_get_compression(Port *port);
++ extern void be_tls_get_version(Port *port, char *ptr, size_t len);
++ extern void be_tls_get_cipher(Port *port, char *ptr, size_t len);
++ extern void be_tls_get_peerdn_name(Port *port, char *ptr, size_t len);
+  #endif
+  
+  extern ProtocolVersion FrontendProtocol;
+*** a/src/include/pgstat.h
+--- b/src/include/pgstat.h
+***************
+*** 732,737 **** typedef struct PgBackendStatus
+--- 732,745 ----
+  	SockAddr	st_clientaddr;
+  	char	   *st_clienthostname;		/* MUST be null-terminated */
+  
++ 	/* Information about SSL connection */
++ 	bool		st_ssl;
++ 	int			st_ssl_bits;
++ 	bool		st_ssl_compression;
++ 	char	   *st_ssl_version;  /* MUST be null-terminated */
++ 	char	   *st_ssl_cipher;   /* MUST be null-terminated */
++ 	char	   *st_ssl_clientdn; /* MUST be null-terminated */
++ 
+  	/* Is backend currently waiting on an lmgr lock? */
+  	bool		st_waiting;
+  

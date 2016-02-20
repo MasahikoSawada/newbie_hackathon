@@ -1,0 +1,25 @@
+diff --git a/src/backend/parser/parse_type.c b/src/backend/parser/parse_type.c
+index ca5fbed..0e9632c 100644
+--- a/src/backend/parser/parse_type.c
++++ b/src/backend/parser/parse_type.c
+@@ -157,13 +157,18 @@ LookupTypeName(ParseState *pstate, const TypeName *typeName,
+ 			/* Look in specific schema only */
+ 			Oid			namespaceId;
+ 
+-			namespaceId = LookupExplicitNamespace(schemaname, missing_ok);
++			namespaceId = LookupExplicitNamespace(schemaname, true);
+ 			if (OidIsValid(namespaceId))
+ 				typoid = GetSysCacheOid2(TYPENAMENSP,
+ 										 PointerGetDatum(typname),
+ 										 ObjectIdGetDatum(namespaceId));
+-			else
++			else if (missing_ok)
+ 				typoid = InvalidOid;
++			else
++				ereport(ERROR,
++						(errcode(ERRCODE_UNDEFINED_SCHEMA),
++						 errmsg("schema \"%s\" does not exist", schemaname),
++						 parser_errposition(pstate, typeName->location)));
+ 		}
+ 		else
+ 		{
