@@ -1,78 +1,68 @@
-1. Add LINE: hint when schemaname.typename is a non-existent schema
-https://commitfest.postgresql.org/4/137/
-　・Version                     : 9.5
-　・Number of patches           : 3
-　・Patch size                  : 200行
-　・Document                    : なし
-　・Regression Test             : あり
-　・Remarks                     : 単純なバグもあり、どこまでこのパッチでカバーするかの議論もあった。
-　・Level                       : 初級
-
-2. pg_stat_ssl view
+■課題パッチ
+1. pg_stat_ssl view
 https://commitfest.postgresql.org/4/54/
 　・Version                     : 9.5
 　・Number of patches           : 4
 　・Patch size                  : 580
 　・Document                    : あり
 　・Regression Test             : あり
-　・Remarks                     : SSLが好きな人には向いている。新しいVIEWを追加するのに必要なコードを学べるし、コード自体は単純。
-　                              　コメントはコード書き方や、ドキュメントについてが多かったので、ちょっと人を選ぶかも。
+　・Remarks                     : SSLが好きな人にはどうぞ。
 　・Level                       : 中級
 
-3. Table-level log_autovacuum_min_duration
+2. Table-level log_autovacuum_min_duration
 https://commitfest.postgresql.org/4/99/
 　・Version                     : 9.5
 　・Number of patches           : 10以上
 　・Patch size                  : 350
 　・Document                    : あり
 　・Regression Test             : なし
-　・Remarks                     : パッチの数は多いが、パッチ自体は簡単。いくつか明白なバグもあったりするので、取組やすいかも。
-　                              　また、VACUUM関連なので前提知識も少なくてよい。
+　・Remarks                     : 特になし
 　・Level                       : 初級
 
-4. pg_file_setting view
+3. pg_file_setting view
 https://commitfest.postgresql.org/4/132/
 　・Version                     : 9.5
 　・Number of patches           : 10
 　・Patch size                  : 360
 　・Document                    : あり
 　・Regression Test             : あり
-　・Remarks                     : パッチ簡単だし、自分が作ったので楽。隠し問題として、Windows対応を出してみても面白いかも。
-　・Level                       : 初中級
+　・Remarks                     : 対象となるパッチが多くあります。
+　・Level                       : 初級
 
-5. GIN pending list clean up exposure to SQL
+4. GIN pending list clean up exposure to SQL
 https://commitfest.postgresql.org/8/456/
 　・Version                     : 9.6
 　・Number of patches           : 5
 　・Patch size                  : 100
 　・Document                    : なし
 　・Regression Test             : なし
-　・Remarks                     : v1はかなりラフで、レビューポイントが満載。ただドキュメントも、リグレッションテストもなし。
-				　また、事前知識もまあまあ必要なのが厄介かも。
+　・Remarks                     : GINインデックスについての簡単な事前知識が必要です。
 　・Level                       : 中級
 
-6. Add sample rate to auto_explain
+5. Add sample rate to auto_explain
 https://commitfest.postgresql.org/9/524/
 　・Version                     : 9.6
 　・Number of patches           : 4
 　・Patch size                  : 50
 　・Document                    : なし
 　・Regression Test             : なし
-　・Remarks                     : auto_explainのパッチで処理もイメージし易いし、パッチサイズも小さい。
-				　現在CFで絶賛RV中なので、特にRVコメントもないのでチャレンジ枠として。
-　・Level                       : 中級
+　・Remarks                     : 絶賛RV中のパッチです。レビューしたらそのままhackersに投げれます。
+　・Level                       : 初中級
 
-7. Support multiple synchronous standby servers
+6. Support multiple synchronous standby servers
 https://commitfest.postgresql.org/9/517/
 　・Version                     : 9.6
 　・Number of patches           : 4
 　・Patch size                  : 900
 　・Document                    : あり
 　・Regression Test             : あり
-　・Remarks                     : レプリケーションにも詳しくなれる。内容もそこまで難しくはなく、目的もわかりやすい。
-				　テスターが必要な状況なので、それについてもちょうどいいかも。
+　・Remarks                     : 絶賛RV中のパッチでレプリケーションの事前知識が必要です。
+				　レプリケーションの基本が同時にマスターできます。
 　・Level                       : 中級
 
 
-
+■番外編
+パッチを作りたい人向け。
+１．Allow vacuumdb -j option be enable even when specifying some tables.
+２．Allow createuser to specify bypassrls option.
 
