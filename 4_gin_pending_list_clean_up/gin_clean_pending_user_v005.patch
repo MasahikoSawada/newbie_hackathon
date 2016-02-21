@@ -1,0 +1,244 @@
+*** a/doc/src/sgml/func.sgml
+--- b/doc/src/sgml/func.sgml
+***************
+*** 18036,18044 **** postgres=# SELECT * FROM pg_xlogfile_name_offset(pg_stop_backup());
+--- 18036,18051 ----
+      <primary>brin_summarize_new_values</primary>
+     </indexterm>
+  
++    <indexterm>
++     <primary>gin_clean_pending_list</primary>
++    </indexterm>
++ 
+     <para>
+      <xref linkend="functions-admin-index-table"> shows the functions
+      available for index maintenance tasks.
++     These functions cannot be executed during recovery.
++     Use of these functions is restricted to superusers and the owner
++     of the given index.
+     </para>
+  
+     <table id="functions-admin-index-table">
+***************
+*** 18056,18061 **** postgres=# SELECT * FROM pg_xlogfile_name_offset(pg_stop_backup());
+--- 18063,18075 ----
+         <entry><type>integer</type></entry>
+         <entry>summarize page ranges not already summarized</entry>
+        </row>
++       <row>
++        <entry>
++         <literal><function>gin_clean_pending_list(<parameter>index</> <type>regclass</>)</function></literal>
++        </entry>
++        <entry><type>bigint</type></entry>
++        <entry>move GIN pending list entries into main index structure</entry>
++       </row>
+       </tbody>
+      </tgroup>
+     </table>
+***************
+*** 18069,18074 **** postgres=# SELECT * FROM pg_xlogfile_name_offset(pg_stop_backup());
+--- 18083,18100 ----
+      into the index.
+     </para>
+  
++    <para>
++     <function>gin_clean_pending_list</> accepts the OID or name of
++     a GIN index and cleans up the pending list of the specified GIN index
++     by moving entries in it to the main GIN data structure in bulk.
++     It returns the number of pages cleaned up from the pending list.
++     Note that the cleanup does not happen and the return value is 0
++     if the argument is the GIN index built with <literal>fastupdate</>
++     option disabled because it doesn't have a pending list.
++     Please see <xref linkend="gin-fast-update"> and <xref linkend="gin-tips">
++     for details of the pending list and <literal>fastupdate</> option.
++    </para>
++ 
+    </sect2>
+  
+    <sect2 id="functions-admin-genfile">
+*** a/doc/src/sgml/gin.sgml
+--- b/doc/src/sgml/gin.sgml
+***************
+*** 734,740 ****
+     from the indexed item). As of <productname>PostgreSQL</productname> 8.4,
+     <acronym>GIN</> is capable of postponing much of this work by inserting
+     new tuples into a temporary, unsorted list of pending entries.
+!    When the table is vacuumed, or if the pending list becomes larger than
+     <xref linkend="guc-gin-pending-list-limit">, the entries are moved to the
+     main <acronym>GIN</acronym> data structure using the same bulk insert
+     techniques used during initial index creation.  This greatly improves
+--- 734,742 ----
+     from the indexed item). As of <productname>PostgreSQL</productname> 8.4,
+     <acronym>GIN</> is capable of postponing much of this work by inserting
+     new tuples into a temporary, unsorted list of pending entries.
+!    When the table is vacuumed or autoanalyzed, or when 
+!    <function>gin_clean_pending_list</function> function is called, or if the
+!    pending list becomes larger than
+     <xref linkend="guc-gin-pending-list-limit">, the entries are moved to the
+     main <acronym>GIN</acronym> data structure using the same bulk insert
+     techniques used during initial index creation.  This greatly improves
+*** a/doc/src/sgml/ref/create_index.sgml
+--- b/doc/src/sgml/ref/create_index.sgml
+***************
+*** 362,369 **** CREATE [ UNIQUE ] INDEX [ CONCURRENTLY ] [ [ IF NOT EXISTS ] <replaceable class=
+        Turning <literal>fastupdate</> off via <command>ALTER INDEX</> prevents
+        future insertions from going into the list of pending index entries,
+        but does not in itself flush previous entries.  You might want to
+!       <command>VACUUM</> the table afterward to ensure the pending list is
+!       emptied.
+       </para>
+      </note>
+      </listitem>
+--- 362,369 ----
+        Turning <literal>fastupdate</> off via <command>ALTER INDEX</> prevents
+        future insertions from going into the list of pending index entries,
+        but does not in itself flush previous entries.  You might want to
+!       <command>VACUUM</> the table or call <function>gin_clean_pending_list</>
+!       function afterward to ensure the pending list is emptied.
+       </para>
+      </note>
+      </listitem>
+*** a/src/backend/access/gin/ginfast.c
+--- b/src/backend/access/gin/ginfast.c
+***************
+*** 20,29 ****
+--- 20,32 ----
+  
+  #include "access/gin_private.h"
+  #include "access/xloginsert.h"
++ #include "access/xlog.h"
+  #include "commands/vacuum.h"
++ #include "catalog/pg_am.h"
+  #include "miscadmin.h"
+  #include "utils/memutils.h"
+  #include "utils/rel.h"
++ #include "utils/acl.h"
+  #include "storage/indexfsm.h"
+  
+  /* GUC parameter */
+***************
+*** 958,960 **** ginInsertCleanup(GinState *ginstate,
+--- 961,1012 ----
+  	MemoryContextSwitchTo(oldCtx);
+  	MemoryContextDelete(opCtx);
+  }
++ 
++ /*
++  * SQL-callable function to clean the insert pending list
++  */
++ Datum
++ gin_clean_pending_list(PG_FUNCTION_ARGS)
++ {
++ 	Oid			indexoid = PG_GETARG_OID(0);
++ 	Relation	indexRel = index_open(indexoid, AccessShareLock);
++ 	IndexBulkDeleteResult stats;
++ 	GinState	ginstate;
++ 
++ 	if (RecoveryInProgress())
++  		ereport(ERROR,
++ 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
++ 				 errmsg("recovery is in progress"),
++ 				 errhint("GIN pending list cannot be cleaned up during recovery.")));
++ 
++ 	/* Must be a GIN index */
++ 	if (indexRel->rd_rel->relkind != RELKIND_INDEX ||
++ 		indexRel->rd_rel->relam != GIN_AM_OID)
++ 		ereport(ERROR,
++ 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
++ 				 errmsg("\"%s\" is not a GIN index",
++ 						RelationGetRelationName(indexRel))));
++ 
++ 	/*
++ 	 * Reject attempts to read non-local temporary relations; we would be
++ 	 * likely to get wrong data since we have no visibility into the owning
++ 	 * session's local buffers.
++ 	 */
++ 	if (RELATION_IS_OTHER_TEMP(indexRel))
++ 		ereport(ERROR,
++ 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++ 			   errmsg("cannot access temporary indexes of other sessions")));
++ 
++ 	/* User must own the index (comparable to privileges needed for VACUUM) */
++ 	if (!pg_class_ownercheck(indexoid, GetUserId()))
++ 		aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_CLASS,
++ 					   RelationGetRelationName(indexRel));
++ 
++ 	memset(&stats, 0, sizeof(stats));
++ 	initGinState(&ginstate, indexRel);
++ 	ginInsertCleanup(&ginstate, true, &stats);
++ 
++ 	index_close(indexRel, AccessShareLock);
++ 
++ 	PG_RETURN_INT64((int64) stats.pages_deleted);
++ }
+*** a/src/include/access/gin_private.h
+--- b/src/include/access/gin_private.h
+***************
+*** 881,886 **** extern void ginFreeScanKeys(GinScanOpaque so);
+--- 881,889 ----
+  /* ginget.c */
+  extern int64 gingetbitmap(IndexScanDesc scan, TIDBitmap *tbm);
+  
++ /* ginfast.c */
++ extern Datum gin_clean_pending_list(PG_FUNCTION_ARGS);
++ 
+  /* ginlogic.c */
+  extern void ginInitConsistentFunction(GinState *ginstate, GinScanKey key);
+  
+*** a/src/include/catalog/pg_proc.h
+--- b/src/include/catalog/pg_proc.h
+***************
+*** 4517,4522 **** DATA(insert OID = 3087 (  gin_extract_tsquery	PGNSP PGUID 12 1 0 0 0 f f f f t f
+--- 4517,4524 ----
+  DESCR("GIN tsvector support (obsolete)");
+  DATA(insert OID = 3088 (  gin_tsquery_consistent PGNSP PGUID 12 1 0 0 0 f f f f t f i s 6 0 16 "2281 21 3615 23 2281 2281" _null_ _null_ _null_ _null_ _null_ gin_tsquery_consistent_6args _null_ _null_ _null_ ));
+  DESCR("GIN tsvector support (obsolete)");
++ DATA(insert OID = 3789 (  gin_clean_pending_list PGNSP PGUID 12 1 0 0 0 f f f f t f v s 1 0 20 "2205" _null_ _null_ _null_ _null_ _null_ gin_clean_pending_list _null_ _null_ _null_ ));
++ DESCR("clean up GIN pending list");
+  
+  DATA(insert OID = 3662 (  tsquery_lt			PGNSP PGUID 12 1 0 0 0 f f f f t f i s 2 0 16 "3615 3615" _null_ _null_ _null_ _null_ _null_ tsquery_lt _null_ _null_ _null_ ));
+  DATA(insert OID = 3663 (  tsquery_le			PGNSP PGUID 12 1 0 0 0 f f f f t f i s 2 0 16 "3615 3615" _null_ _null_ _null_ _null_ _null_ tsquery_le _null_ _null_ _null_ ));
+*** a/src/test/regress/expected/gin.out
+--- b/src/test/regress/expected/gin.out
+***************
+*** 8,14 **** create table gin_test_tbl(i int4[]);
+--- 8,27 ----
+  create index gin_test_idx on gin_test_tbl using gin (i) with (fastupdate = on);
+  insert into gin_test_tbl select array[1, 2, g] from generate_series(1, 20000) g;
+  insert into gin_test_tbl select array[1, 3, g] from generate_series(1, 1000) g;
++ select gin_clean_pending_list('gin_test_idx')>10 as many; -- flush the fastupdate buffers
++  many 
++ ------
++  t
++ (1 row)
++ 
++ insert into gin_test_tbl select array[3, 1, g] from generate_series(1, 1000) g;
+  vacuum gin_test_tbl; -- flush the fastupdate buffers
++ select gin_clean_pending_list('gin_test_idx'); -- nothing to flush
++  gin_clean_pending_list 
++ ------------------------
++                       0
++ (1 row)
++ 
+  -- Test vacuuming
+  delete from gin_test_tbl where i @> array[2];
+  vacuum gin_test_tbl;
+*** a/src/test/regress/sql/gin.sql
+--- b/src/test/regress/sql/gin.sql
+***************
+*** 10,17 **** create index gin_test_idx on gin_test_tbl using gin (i) with (fastupdate = on);
+--- 10,23 ----
+  insert into gin_test_tbl select array[1, 2, g] from generate_series(1, 20000) g;
+  insert into gin_test_tbl select array[1, 3, g] from generate_series(1, 1000) g;
+  
++ select gin_clean_pending_list('gin_test_idx')>10 as many; -- flush the fastupdate buffers
++ 
++ insert into gin_test_tbl select array[3, 1, g] from generate_series(1, 1000) g;
++ 
+  vacuum gin_test_tbl; -- flush the fastupdate buffers
+  
++ select gin_clean_pending_list('gin_test_idx'); -- nothing to flush
++ 
+  -- Test vacuuming
+  delete from gin_test_tbl where i @> array[2];
+  vacuum gin_test_tbl;

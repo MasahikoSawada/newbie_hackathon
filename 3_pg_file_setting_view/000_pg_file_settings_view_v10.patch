@@ -1,0 +1,363 @@
+diff --git a/doc/src/sgml/catalogs.sgml b/doc/src/sgml/catalogs.sgml
+index 4b79958..adb8628 100644
+--- a/doc/src/sgml/catalogs.sgml
++++ b/doc/src/sgml/catalogs.sgml
+@@ -7560,6 +7560,11 @@
+      </row>
+ 
+      <row>
++      <entry><link linkend="view-pg-file-settings"><structname>pg_file_settings</structname></link></entry>
++      <entry>parameter settings of file</entry>
++     </row>
++
++     <row>
+       <entry><link linkend="view-pg-shadow"><structname>pg_shadow</structname></link></entry>
+       <entry>database users</entry>
+      </row>
+@@ -9173,6 +9178,74 @@ SELECT * FROM pg_locks pl LEFT JOIN pg_prepared_xacts ppx
+ 
+  </sect1>
+ 
++ <sect1 id="view-pg-file-settings">
++  <title><structname>pg_file_settings</structname></title>
++
++  <indexterm zone="view-pg-file-settings">
++   <primary>pg_file_settings</primary>
++  </indexterm>
++
++  <para>
++   The view <structname>pg_file_settings</structname> provides access to
++   run-time parameters stored in configuration files.
++   In contrast to <structname>pg_settings</structname> a row is provided for
++   each occurrence of the parameter in a configuration file. This is helpful
++   for discovering why one value may have been used in preference to another
++   when the parameters were loaded.
++  </para>
++
++  <table>
++   <title><structname>pg_file_settings</> Columns</title>
++
++  <tgroup cols="3">
++   <thead>
++    <row>
++     <entry>Name</entry>
++     <entry>Type</entry>
++     <entry>Description</entry>
++    </row>
++   </thead>
++   <tbody>
++    <row>
++     <entry><structfield>sourcefile</structfield></entry>
++     <entry><structfield>text</structfield></entry>
++     <entry>A path of configration file</entry>
++    </row>
++    <row>
++     <entry><structfield>sourceline</structfield></entry>
++     <entry><structfield>integer</structfield></entry>
++     <entry>
++      Line number within the configuration file the current value was
++      set at (null for values set from sources other than configuration files,
++      or when examined by a non-superuser)
++     </entry>
++    </row>
++    <row>
++     <entry><structfield>seqno</structfield></entry>
++     <entry><structfield>integer</structfield></entry>
++     <entry>Order in which the setting was loaded from the configuration</entry>
++    </row>
++    <row>
++     <entry><structfield>name</structfield></entry>
++     <entry><structfield>text</structfield></entry>
++     <entry>
++      Configuration file the current value was set in (null for values
++      set from sources other than configuration files, or when examined by a
++      non-superuser); helpful when using <literal>include</literal> directives in
++      configuration files
++     </entry>
++    </row>
++    <row>
++     <entry><structfield>setting</structfield></entry>
++     <entry><structfield>text</structfield></entry>
++     <entry>Run-time configuration parameter name</entry>
++    </row>
++   </tbody>
++  </tgroup>
++ </table>
++
++</sect1>
++
+  <sect1 id="view-pg-shadow">
+   <title><structname>pg_shadow</structname></title>
+ 
+diff --git a/src/backend/catalog/system_views.sql b/src/backend/catalog/system_views.sql
+index 2ad01f4..18921c4 100644
+--- a/src/backend/catalog/system_views.sql
++++ b/src/backend/catalog/system_views.sql
+@@ -411,6 +411,12 @@ CREATE RULE pg_settings_n AS
+ 
+ GRANT SELECT, UPDATE ON pg_settings TO PUBLIC;
+ 
++CREATE VIEW pg_file_settings AS
++   SELECT * FROM pg_show_all_file_settings() AS A;
++
++REVOKE ALL on pg_file_settings FROM PUBLIC;
++REVOKE EXECUTE ON FUNCTION pg_show_all_file_settings() FROM PUBLIC;
++
+ CREATE VIEW pg_timezone_abbrevs AS
+     SELECT * FROM pg_timezone_abbrevs();
+ 
+diff --git a/src/backend/utils/misc/guc-file.l b/src/backend/utils/misc/guc-file.l
+index c5e0fac..873d950 100644
+--- a/src/backend/utils/misc/guc-file.l
++++ b/src/backend/utils/misc/guc-file.l
+@@ -119,6 +119,8 @@ ProcessConfigFile(GucContext context)
+ 	ConfigVariable *item,
+ 			   *head,
+ 			   *tail;
++	ConfigFileVariable *guc_array;
++	size_t			guc_array_size;
+ 	int			i;
+ 
+ 	/*
+@@ -217,6 +219,9 @@ ProcessConfigFile(GucContext context)
+ 		gconf->status &= ~GUC_IS_IN_FILE;
+ 	}
+ 
++	/* Reset number of guc_file_variables */
++	num_guc_file_variables = 0;
++
+ 	/*
+ 	 * Check if all the supplied option names are valid, as an additional
+ 	 * quasi-syntactic check on the validity of the config file.  It is
+@@ -255,6 +260,7 @@ ProcessConfigFile(GucContext context)
+ 			error = true;
+ 			ConfFileWithError = item->filename;
+ 		}
++		num_guc_file_variables++;
+ 	}
+ 
+ 	/*
+@@ -342,6 +348,47 @@ ProcessConfigFile(GucContext context)
+ 	}
+ 
+ 	/*
++	 * Calculate size of guc_array and allocate it. From the secound time to allcate memory,
++	 * we should free old allocated memory.
++	 */
++	guc_array_size = num_guc_file_variables * sizeof(struct ConfigFileVariable);
++	if (!guc_file_variables)
++	{
++		/* For the first call */
++		guc_file_variables = (ConfigFileVariable *) guc_malloc(FATAL, guc_array_size);
++	}
++	else
++	{
++		int i;
++
++		for (i = 0; i < prev_num_guc_file_variables; i++)
++		{
++			free(guc_file_variables[i].name);
++			free(guc_file_variables[i].value);
++			free(guc_file_variables[i].filename);
++		}
++
++		guc_file_variables = (ConfigFileVariable *) guc_realloc(FATAL,
++									guc_file_variables,
++									guc_array_size);
++	}
++
++	/* Keep remember for reloading conf file */
++	prev_num_guc_file_variables = num_guc_file_variables;
++
++	/*
++	 * Apply guc config parameters to guc_file_variable
++	 */
++	guc_array = guc_file_variables;
++	for (item = head; item; item = item->next, guc_array++)
++	{
++		guc_array->name = guc_strdup(FATAL, item->name);
++		guc_array->value = guc_strdup(FATAL, item->value);
++		guc_array->filename = guc_strdup(FATAL, item->filename);
++		guc_array->sourceline = item->sourceline;
++	}
++
++	/*
+ 	 * Now apply the values from the config file.
+ 	 */
+ 	for (item = head; item; item = item->next)
+diff --git a/src/backend/utils/misc/guc.c b/src/backend/utils/misc/guc.c
+index f43aff2..8076d1a 100644
+--- a/src/backend/utils/misc/guc.c
++++ b/src/backend/utils/misc/guc.c
+@@ -3678,6 +3678,24 @@ static struct config_generic **guc_variables;
+ /* Current number of variables contained in the vector */
+ static int	num_guc_variables;
+ 
++/*
++ * Lookup of variables for pg_file_settings view.
++ * guc_file_variables is an array of length num_guc_file_variables.
++ */
++typedef struct ConfigFileVariable
++{
++	char	*name;
++	char	*value;
++	char	*filename;
++	int		sourceline;
++} ConfigFileVariable;
++static struct ConfigFileVariable *guc_file_variables;
++
++/* Number of file variables */
++static int	num_guc_file_variables;
++/* Number of before reload variables */
++static int  prev_num_guc_file_variables;
++
+ /* Vector capacity */
+ static int	size_guc_variables;
+ 
+@@ -8125,6 +8143,104 @@ show_all_settings(PG_FUNCTION_ARGS)
+ 	}
+ }
+ 
++/*
++ * show_all_file_settings - return the all parameters that are
++ * defined in configuration file.
++ */
++
++#define NUM_PG_FILE_SETTINGS_ATTS 5
++
++Datum
++show_all_file_settings(PG_FUNCTION_ARGS)
++{
++	FuncCallContext *funcctx;
++	TupleDesc	tupdesc;
++	int			call_cntr;
++	int			max_calls;
++	AttInMetadata *attinmeta;
++	MemoryContext oldcontext;
++
++	if (SRF_IS_FIRSTCALL())
++	{
++		funcctx = SRF_FIRSTCALL_INIT();
++
++		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
++
++		/*
++		 * need a tuple descriptor representing NUM_PG_SETTINGS_ATTS columns
++		 * of the appropriate types
++		 */
++
++		tupdesc = CreateTemplateTupleDesc(NUM_PG_FILE_SETTINGS_ATTS, false);
++		TupleDescInitEntry(tupdesc, (AttrNumber) 1, "sourcefile",
++						   TEXTOID, -1, 0);
++		TupleDescInitEntry(tupdesc, (AttrNumber) 2, "sourceline",
++						   INT4OID, -1, 0);
++		TupleDescInitEntry(tupdesc, (AttrNumber) 3, "seqno",
++						   INT4OID, -1, 0);
++		TupleDescInitEntry(tupdesc, (AttrNumber) 4, "name",
++						   TEXTOID, -1, 0);
++		TupleDescInitEntry(tupdesc, (AttrNumber) 5, "setting",
++						   TEXTOID, -1, 0);
++
++		attinmeta = TupleDescGetAttInMetadata(tupdesc);
++		funcctx->attinmeta = attinmeta;
++		funcctx->max_calls = num_guc_file_variables;
++		MemoryContextSwitchTo(oldcontext);
++	}
++
++	funcctx = SRF_PERCALL_SETUP();
++
++	call_cntr = funcctx->call_cntr;
++	max_calls = funcctx->max_calls;
++	attinmeta = funcctx->attinmeta;
++
++	if (call_cntr < max_calls)
++	{
++		char	   *values[NUM_PG_FILE_SETTINGS_ATTS];
++		HeapTuple	tuple;
++		Datum		result;
++		ConfigFileVariable conf;
++		char		buffer[8];
++
++		/* Check to avoid going past end of array */
++		if (call_cntr > num_guc_file_variables)
++			SRF_RETURN_DONE(funcctx);
++
++		conf = guc_file_variables[call_cntr];
++
++		/* sourcefile */
++		values[0] = conf.filename;
++
++		/* sourceline */
++		pg_ltoa(conf.sourceline, buffer);
++		values[1] = pstrdup(buffer);
++
++		/* seqno */
++		pg_ltoa(call_cntr + 1, buffer);
++		values[2] = pstrdup(buffer);
++
++		/* name */
++		values[3] = conf.name;
++
++		/* setting */
++		values[4] = conf.value;
++
++		/* build a tuple */
++		tuple = BuildTupleFromCStrings(attinmeta, values);
++
++		/* make the tuple into a datum */
++		result = HeapTupleGetDatum(tuple);
++
++		SRF_RETURN_NEXT(funcctx, result);
++	}
++	else
++	{
++		SRF_RETURN_DONE(funcctx);
++	}
++
++}
++
+ static char *
+ _ShowOption(struct config_generic * record, bool use_units)
+ {
+diff --git a/src/include/catalog/pg_proc.h b/src/include/catalog/pg_proc.h
+index 55c246e..fdd8210 100644
+--- a/src/include/catalog/pg_proc.h
++++ b/src/include/catalog/pg_proc.h
+@@ -3052,6 +3052,8 @@ DATA(insert OID = 2078 (  set_config		PGNSP PGUID 12 1 0 0 0 f f f f f f v 3 0 2
+ DESCR("SET X as a function");
+ DATA(insert OID = 2084 (  pg_show_all_settings	PGNSP PGUID 12 1 1000 0 0 f f f f t t s 0 0 2249 "" "{25,25,25,25,25,25,25,25,25,25,25,1009,25,25,25,23}" "{o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o}" "{name,setting,unit,category,short_desc,extra_desc,context,vartype,source,min_val,max_val,enumvals,boot_val,reset_val,sourcefile,sourceline}" _null_ _null_ show_all_settings _null_ _null_ _null_ ));
+ DESCR("SHOW ALL as a function");
++DATA(insert OID = 3329 (  pg_show_all_file_settings	PGNSP PGUID 12 1 1000 0 0 f f f f t t s 0 0 2249 "" "{25,23,23,25,25}" "{o,o,o,o,o}" "{sourcefile,sourceline,seqno,name,setting}" _null_ _null_ show_all_file_settings _null_ _null_ _null_ ));
++DESCR("show config file settings");
+ DATA(insert OID = 1371 (  pg_lock_status   PGNSP PGUID 12 1 1000 0 0 f f f f t t v 0 0 2249 "" "{25,26,26,23,21,25,28,26,26,21,25,23,25,16,16}" "{o,o,o,o,o,o,o,o,o,o,o,o,o,o,o}" "{locktype,database,relation,page,tuple,virtualxid,transactionid,classid,objid,objsubid,virtualtransaction,pid,mode,granted,fastpath}" _null_ _null_ pg_lock_status _null_ _null_ _null_ ));
+ DESCR("view system lock information");
+ DATA(insert OID = 1065 (  pg_prepared_xact PGNSP PGUID 12 1 1000 0 0 f f f f t t v 0 0 2249 "" "{28,25,1184,26,26}" "{o,o,o,o,o}" "{transaction,gid,prepared,ownerid,dbid}" _null_ _null_ pg_prepared_xact _null_ _null_ _null_ ));
+diff --git a/src/include/utils/builtins.h b/src/include/utils/builtins.h
+index 33a453f..637561b 100644
+--- a/src/include/utils/builtins.h
++++ b/src/include/utils/builtins.h
+@@ -1098,6 +1098,7 @@ extern Datum quote_nullable(PG_FUNCTION_ARGS);
+ extern Datum show_config_by_name(PG_FUNCTION_ARGS);
+ extern Datum set_config_by_name(PG_FUNCTION_ARGS);
+ extern Datum show_all_settings(PG_FUNCTION_ARGS);
++extern Datum show_all_file_settings(PG_FUNCTION_ARGS);
+ 
+ /* lockfuncs.c */
+ extern Datum pg_lock_status(PG_FUNCTION_ARGS);
+diff --git a/src/test/regress/expected/rules.out b/src/test/regress/expected/rules.out
+index f7f016b..2de6d16 100644
+--- a/src/test/regress/expected/rules.out
++++ b/src/test/regress/expected/rules.out
+@@ -1308,6 +1308,12 @@ pg_cursors| SELECT c.name,
+     c.is_scrollable,
+     c.creation_time
+    FROM pg_cursor() c(name, statement, is_holdable, is_binary, is_scrollable, creation_time);
++pg_file_settings| SELECT a.sourcefile,
++    a.sourceline,
++    a.seqno,
++    a.name,
++    a.setting
++   FROM pg_show_all_file_settings() a(sourcefile, sourceline, seqno, name, setting);
+ pg_group| SELECT pg_authid.rolname AS groname,
+     pg_authid.oid AS grosysid,
+     ARRAY( SELECT pg_auth_members.member

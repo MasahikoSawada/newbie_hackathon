@@ -1,0 +1,60 @@
+diff --git a/contrib/pageinspect/ginfuncs.c b/contrib/pageinspect/ginfuncs.c
+new file mode 100644
+index c0de3be..297e697
+*** a/contrib/pageinspect/ginfuncs.c
+--- b/contrib/pageinspect/ginfuncs.c
+***************
+*** 27,32 ****
+--- 27,33 ----
+  PG_FUNCTION_INFO_V1(gin_metapage_info);
+  PG_FUNCTION_INFO_V1(gin_page_opaque_info);
+  PG_FUNCTION_INFO_V1(gin_leafpage_items);
++ PG_FUNCTION_INFO_V1(gin_clean_pending_list);
+  
+  Datum
+  gin_metapage_info(PG_FUNCTION_ARGS)
+*************** gin_leafpage_items(PG_FUNCTION_ARGS)
+*** 279,281 ****
+--- 280,305 ----
+  	else
+  		SRF_RETURN_DONE(fctx);
+  }
++ 
++ 
++ 
++ /*
++  * Clear the pending list
++  *
++  * Usage: SELECT * FROM gin_clean_pending_list('idx'::regclass);
++  */
++ Datum
++ gin_clean_pending_list(PG_FUNCTION_ARGS)
++ {
++ 	Oid			indexRelid = PG_GETARG_OID(0);
++ 	Relation	indexRel = index_open(indexRelid, AccessShareLock);
++ 	IndexBulkDeleteResult stats;
++ 	GinState	ginstate;
++ 
++ 	memset(&stats, 0, sizeof(stats));
++ 	initGinState(&ginstate, indexRel);
++ 	ginInsertCleanup(&ginstate, true, &stats);
++ 
++ 	index_close(indexRel, AccessShareLock);
++ 	PG_RETURN_INT64((int64) stats.pages_deleted);
++ };
+diff --git a/contrib/pageinspect/pageinspect--1.3.sql b/contrib/pageinspect/pageinspect--1.3.sql
+new file mode 100644
+index a99e058..8e4a20e
+*** a/contrib/pageinspect/pageinspect--1.3.sql
+--- b/contrib/pageinspect/pageinspect--1.3.sql
+*************** CREATE FUNCTION gin_leafpage_items(IN pa
+*** 187,189 ****
+--- 187,194 ----
+  RETURNS SETOF record
+  AS 'MODULE_PATHNAME', 'gin_leafpage_items'
+  LANGUAGE C STRICT;
++ 
++ CREATE FUNCTION gin_clean_pending_list(IN index_oid regclass)
++ RETURNS bigint 
++ AS 'MODULE_PATHNAME', 'gin_clean_pending_list'
++ LANGUAGE C STRICT;
