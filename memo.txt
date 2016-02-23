@@ -60,6 +60,16 @@ https://commitfest.postgresql.org/9/517/
 				　レプリケーションの基本が同時にマスターできます。
 　・Level                       : 中級
 
+7. Implement pg_controldata & pg_config as system SRFs/views
+https://commitfest.postgresql.org/8/334/
+　・Version                     : 9.6 (pg_configはcommit済み。pg_controldataはこれから)
+　・Number of patches           : ?
+　・Patch size                  : 1000
+　・Document                    : あり
+　・Regression Test             : あり
+　・Remarks                     : 新しく入ったパッチで、まだ追加機能が開発中。
+				　処理内容もわかりやすく、単純なビューを用意するだけなので簡単です。バグもあるかも。
+　・Level                       : 中級
 
 ■番外編
 パッチを作りたい人向け。
