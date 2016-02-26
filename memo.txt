@@ -1,3 +1,8 @@
+■デモパッチ
+REINDEX SCHEMA
+コミット：8001fe6
+
+
 ■課題パッチ
 1. pg_stat_ssl view
 https://commitfest.postgresql.org/4/54/
@@ -60,7 +65,19 @@ https://commitfest.postgresql.org/9/517/
 				　レプリケーションの基本が同時にマスターできます。
 　・Level                       : 中級
 
-7. Implement pg_controldata & pg_config as system SRFs/views
+7. VACUUM Progress Checker
+https://commitfest.postgresql.org/9/545/
+　・Version                     : 9.6
+　・Number of patches           : 1
+　・Patch size                  : 600
+　・Document                    : あり
+　・Regression Test             : なし
+　・Remarks                     : VACUUMの進捗状況をVIEWで見る新機能。
+				　処理内容がわかりやすいし、多分バグが多くある。
+　・Level                       : 初級
+
+
+8. Implement pg_controldata & pg_config as system SRFs/views
 https://commitfest.postgresql.org/8/334/
 　・Version                     : 9.6 (pg_configはcommit済み。pg_controldataはこれから)
 　・Number of patches           : ?

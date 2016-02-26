@@ -1,0 +1,651 @@
+commit fe263d115a7dd16095b8b8f1e943aff2bb4574d2
+Author: Simon Riggs <simon@2ndQuadrant.com>
+Date:   Tue Dec 9 00:28:00 2014 +0900
+
+    REINDEX SCHEMA
+    
+    Add new SCHEMA option to REINDEX and reindexdb.
+    
+    Sawada Masahiko
+    
+    Reviewed by Michael Paquier and Fabrízio de Royes Mello
+
+diff --git a/doc/src/sgml/ref/reindex.sgml b/doc/src/sgml/ref/reindex.sgml
+index cabae19..0a4c7d4 100644
+--- a/doc/src/sgml/ref/reindex.sgml
++++ b/doc/src/sgml/ref/reindex.sgml
+@@ -21,7 +21,7 @@ PostgreSQL documentation
+ 
+  <refsynopsisdiv>
+ <synopsis>
+-REINDEX { INDEX | TABLE | DATABASE | SYSTEM } <replaceable class="PARAMETER">name</replaceable> [ FORCE ]
++REINDEX { INDEX | TABLE | SCHEMA | DATABASE | SYSTEM } <replaceable class="PARAMETER">name</replaceable> [ FORCE ]
+ </synopsis>
+  </refsynopsisdiv>
+ 
+@@ -101,6 +101,19 @@ REINDEX { INDEX | TABLE | DATABASE | SYSTEM } <replaceable class="PARAMETER">nam
+    </varlistentry>
+ 
+    <varlistentry>
++    <term><literal>SCHEMA</literal></term>
++    <listitem>
++     <para>
++      Recreate all indexes of the specified schema.  If a table of this
++      schema has a secondary <quote>TOAST</> table, that is reindexed as
++      well. Indexes on shared system catalogs are also processed.
++      This form of <command>REINDEX</command> cannot be executed inside a
++      transaction block.
++     </para>
++    </listitem>
++   </varlistentry>
++
++   <varlistentry>
+     <term><literal>DATABASE</literal></term>
+     <listitem>
+      <para>
+diff --git a/doc/src/sgml/ref/reindexdb.sgml b/doc/src/sgml/ref/reindexdb.sgml
+index 486f5c9..b5b449c 100644
+--- a/doc/src/sgml/ref/reindexdb.sgml
++++ b/doc/src/sgml/ref/reindexdb.sgml
+@@ -27,6 +27,16 @@ PostgreSQL documentation
+    <arg choice="plain" rep="repeat">
+     <arg choice="opt">
+      <group choice="plain">
++      <arg choice="plain"><option>--schema</option></arg>
++      <arg choice="plain"><option>-S</option></arg>
++     </group>
++     <replaceable>table</replaceable>
++    </arg>
++   </arg>
++
++   <arg choice="plain" rep="repeat">
++    <arg choice="opt">
++     <group choice="plain">
+       <arg choice="plain"><option>--table</option></arg>
+       <arg choice="plain"><option>-t</option></arg>
+      </group>
+@@ -162,6 +172,18 @@ PostgreSQL documentation
+      </varlistentry>
+ 
+      <varlistentry>
++      <term><option>-S <replaceable class="parameter">schema</replaceable></></term>
++      <term><option>--schema=<replaceable class="parameter">schema</replaceable></></term>
++      <listitem>
++       <para>
++        Reindex <replaceable class="parameter">schema</replaceable> only.
++        Multiple schemas can be reindexed by writing multiple
++        <option>-S</> switches.
++       </para>
++      </listitem>
++     </varlistentry>
++
++     <varlistentry>
+       <term><option>-t <replaceable class="parameter">table</replaceable></></term>
+       <term><option>--table=<replaceable class="parameter">table</replaceable></></term>
+       <listitem>
+diff --git a/src/backend/commands/indexcmds.c b/src/backend/commands/indexcmds.c
+index 12b4ac7..a3e8a15 100644
+--- a/src/backend/commands/indexcmds.c
++++ b/src/backend/commands/indexcmds.c
+@@ -1777,34 +1777,58 @@ ReindexTable(RangeVar *relation)
+ }
+ 
+ /*
+- * ReindexDatabase
+- *		Recreate indexes of a database.
++ * ReindexObject
++ *		Recreate indexes of object whose type is defined by objectKind.
+  *
+  * To reduce the probability of deadlocks, each table is reindexed in a
+  * separate transaction, so we can release the lock on it right away.
+  * That means this must not be called within a user transaction block!
+  */
+ Oid
+-ReindexDatabase(const char *databaseName, bool do_system, bool do_user)
++ReindexObject(const char *objectName, ReindexObjectType objectKind)
+ {
++	Oid			objectOid;
+ 	Relation	relationRelation;
+ 	HeapScanDesc scan;
++	ScanKeyData	*scan_keys = NULL;
+ 	HeapTuple	tuple;
+ 	MemoryContext private_context;
+ 	MemoryContext old;
+ 	List	   *relids = NIL;
+ 	ListCell   *l;
++	int	num_keys;
+ 
+-	AssertArg(databaseName);
++	AssertArg(objectName);
++	Assert(objectKind == REINDEX_OBJECT_SCHEMA ||
++		   objectKind == REINDEX_OBJECT_SYSTEM ||
++		   objectKind == REINDEX_OBJECT_DATABASE);
+ 
+-	if (strcmp(databaseName, get_database_name(MyDatabaseId)) != 0)
+-		ereport(ERROR,
+-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+-				 errmsg("can only reindex the currently open database")));
++	/*
++	 * Get OID of object to reindex, being the database currently being
++	 * used by session for a database or for system catalogs, or the schema
++	 * defined by caller. At the same time do permission checks that need
++	 * different processing depending on the object type.
++	 */
++	if (objectKind == REINDEX_OBJECT_SCHEMA)
++	{
++		objectOid = get_namespace_oid(objectName, false);
+ 
+-	if (!pg_database_ownercheck(MyDatabaseId, GetUserId()))
+-		aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_DATABASE,
+-					   databaseName);
++		if (!pg_namespace_ownercheck(objectOid, GetUserId()))
++			aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_NAMESPACE,
++						   objectName);
++	}
++	else
++	{
++		objectOid = MyDatabaseId;
++
++		if (strcmp(objectName, get_database_name(MyDatabaseId)) != 0)
++			ereport(ERROR,
++					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++					 errmsg("can only reindex the currently open database")));
++		if (!pg_database_ownercheck(MyDatabaseId, GetUserId()))
++			aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_DATABASE,
++						   objectName);
++	}
+ 
+ 	/*
+ 	 * Create a memory context that will survive forced transaction commits we
+@@ -1813,18 +1837,23 @@ ReindexDatabase(const char *databaseName, bool do_system, bool do_user)
+ 	 * abort cleanup logic.
+ 	 */
+ 	private_context = AllocSetContextCreate(PortalContext,
+-											"ReindexDatabase",
++											(objectKind == REINDEX_OBJECT_SCHEMA) ?
++											"ReindexSchema" : "ReindexDatabase",
+ 											ALLOCSET_DEFAULT_MINSIZE,
+ 											ALLOCSET_DEFAULT_INITSIZE,
+ 											ALLOCSET_DEFAULT_MAXSIZE);
+ 
+ 	/*
+-	 * We always want to reindex pg_class first.  This ensures that if there
+-	 * is any corruption in pg_class' indexes, they will be fixed before we
+-	 * process any other tables.  This is critical because reindexing itself
+-	 * will try to update pg_class.
++	 * We always want to reindex pg_class first when reindexing system
++	 * catalogs or a database.  This ensures that if there is any corruption
++	 * in pg_class' indexes, they will be fixed before we process any other
++	 * tables.  This is critical because reindexing itself will try to
++	 * update pg_class.
+ 	 */
+-	if (do_system)
++	if (objectKind == REINDEX_OBJECT_DATABASE ||
++		objectKind == REINDEX_OBJECT_SYSTEM ||
++		(objectKind == REINDEX_OBJECT_SCHEMA &&
++		 IsSystemNamespace(objectOid)))
+ 	{
+ 		old = MemoryContextSwitchTo(private_context);
+ 		relids = lappend_oid(relids, RelationRelationId);
+@@ -1832,13 +1861,34 @@ ReindexDatabase(const char *databaseName, bool do_system, bool do_user)
+ 	}
+ 
+ 	/*
++	 * Define the search keys to find the objects to reindex. For a schema,
++	 * we search target relations using relnamespace and relkind, something
++	 * not necessary for a database-wide operation.
++	 */
++	if (objectKind == REINDEX_OBJECT_SCHEMA)
++	{
++		scan_keys = palloc(sizeof(ScanKeyData) * 2);
++		ScanKeyInit(&scan_keys[0],
++					Anum_pg_class_relnamespace,
++					BTEqualStrategyNumber, F_OIDEQ,
++					ObjectIdGetDatum(objectOid));
++		ScanKeyInit(&scan_keys[1],
++					Anum_pg_class_relkind,
++					BTEqualStrategyNumber, F_CHAREQ,
++					'r');
++		num_keys = 2;
++	}
++	else
++		num_keys = 0;
++
++	/*
+ 	 * Scan pg_class to build a list of the relations we need to reindex.
+ 	 *
+ 	 * We only consider plain relations and materialized views here (toast
+ 	 * rels will be processed indirectly by reindex_relation).
+ 	 */
+ 	relationRelation = heap_open(RelationRelationId, AccessShareLock);
+-	scan = heap_beginscan_catalog(relationRelation, 0, NULL);
++	scan = heap_beginscan_catalog(relationRelation, num_keys, scan_keys);
+ 	while ((tuple = heap_getnext(scan, ForwardScanDirection)) != NULL)
+ 	{
+ 		Form_pg_class classtuple = (Form_pg_class) GETSTRUCT(tuple);
+@@ -1854,19 +1904,17 @@ ReindexDatabase(const char *databaseName, bool do_system, bool do_user)
+ 			continue;
+ 
+ 		/* Check user/system classification, and optionally skip */
+-		if (IsSystemClass(relid, classtuple))
+-		{
+-			if (!do_system)
+-				continue;
+-		}
+-		else
+-		{
+-			if (!do_user)
+-				continue;
+-		}
++		if (!IsSystemClass(relid, classtuple) &&
++			objectKind == REINDEX_OBJECT_SYSTEM)
++			continue;
+ 
++		/*
++		 * Already have it in the case of system catalogs being all
++		 * reindexed, of a database or of a system catalog being reindexed
++		 * as a schema.
++		 */
+ 		if (HeapTupleGetOid(tuple) == RelationRelationId)
+-			continue;			/* got it already */
++			continue;
+ 
+ 		old = MemoryContextSwitchTo(private_context);
+ 		relids = lappend_oid(relids, relid);
+@@ -1898,6 +1946,8 @@ ReindexDatabase(const char *databaseName, bool do_system, bool do_user)
+ 	StartTransactionCommand();
+ 
+ 	MemoryContextDelete(private_context);
++	if (scan_keys)
++		pfree(scan_keys);
+ 
+-	return MyDatabaseId;
++	return objectOid;
+ }
+diff --git a/src/backend/parser/gram.y b/src/backend/parser/gram.y
+index 7e48958..4b5009b 100644
+--- a/src/backend/parser/gram.y
++++ b/src/backend/parser/gram.y
+@@ -404,7 +404,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
+ %type <boolean> copy_from opt_program
+ 
+ %type <ival>	opt_column event cursor_options opt_hold opt_set_data
+-%type <objtype>	reindex_type drop_type comment_type security_label_type
++%type <objtype>	drop_type comment_type security_label_type
+ 
+ %type <node>	fetch_args limit_clause select_limit_value
+ 				offset_clause select_offset_value
+@@ -7198,41 +7198,48 @@ opt_if_exists: IF_P EXISTS						{ $$ = TRUE; }
+  *****************************************************************************/
+ 
+ ReindexStmt:
+-			REINDEX reindex_type qualified_name opt_force
++			REINDEX INDEX qualified_name opt_force
+ 				{
+ 					ReindexStmt *n = makeNode(ReindexStmt);
+-					n->kind = $2;
++					n->kind = REINDEX_OBJECT_INDEX;
+ 					n->relation = $3;
+ 					n->name = NULL;
+ 					$$ = (Node *)n;
+ 				}
++			| REINDEX TABLE qualified_name opt_force
++				{
++					ReindexStmt *n = makeNode(ReindexStmt);
++					n->kind = REINDEX_OBJECT_TABLE;
++					n->relation = $3;
++					n->name = NULL;
++					$$ = (Node *)n;
++				}
++			| REINDEX SCHEMA name opt_force
++				{
++					ReindexStmt *n = makeNode(ReindexStmt);
++					n->kind = REINDEX_OBJECT_SCHEMA;
++					n->name = $3;
++					n->relation = NULL;
++					$$ = (Node *)n;
++				}
+ 			| REINDEX SYSTEM_P name opt_force
+ 				{
+ 					ReindexStmt *n = makeNode(ReindexStmt);
+-					n->kind = OBJECT_DATABASE;
++					n->kind = REINDEX_OBJECT_SYSTEM;
+ 					n->name = $3;
+ 					n->relation = NULL;
+-					n->do_system = true;
+-					n->do_user = false;
+ 					$$ = (Node *)n;
+ 				}
+ 			| REINDEX DATABASE name opt_force
+ 				{
+ 					ReindexStmt *n = makeNode(ReindexStmt);
+-					n->kind = OBJECT_DATABASE;
++					n->kind = REINDEX_OBJECT_DATABASE;
+ 					n->name = $3;
+ 					n->relation = NULL;
+-					n->do_system = true;
+-					n->do_user = true;
+ 					$$ = (Node *)n;
+ 				}
+ 		;
+ 
+-reindex_type:
+-			INDEX									{ $$ = OBJECT_INDEX; }
+-			| TABLE									{ $$ = OBJECT_TABLE; }
+-		;
+-
+ opt_force:	FORCE									{  $$ = TRUE; }
+ 			| /* EMPTY */							{  $$ = FALSE; }
+ 		;
+diff --git a/src/backend/tcop/utility.c b/src/backend/tcop/utility.c
+index 58f78ce..aa8fe88 100644
+--- a/src/backend/tcop/utility.c
++++ b/src/backend/tcop/utility.c
+@@ -749,14 +749,15 @@ standard_ProcessUtility(Node *parsetree,
+ 				PreventCommandDuringRecovery("REINDEX");
+ 				switch (stmt->kind)
+ 				{
+-					case OBJECT_INDEX:
++					case REINDEX_OBJECT_INDEX:
+ 						ReindexIndex(stmt->relation);
+ 						break;
+-					case OBJECT_TABLE:
+-					case OBJECT_MATVIEW:
++					case REINDEX_OBJECT_TABLE:
+ 						ReindexTable(stmt->relation);
+ 						break;
+-					case OBJECT_DATABASE:
++					case REINDEX_OBJECT_SCHEMA:
++					case REINDEX_OBJECT_SYSTEM:
++					case REINDEX_OBJECT_DATABASE:
+ 
+ 						/*
+ 						 * This cannot run inside a user transaction block; if
+@@ -765,9 +766,9 @@ standard_ProcessUtility(Node *parsetree,
+ 						 * intended effect!
+ 						 */
+ 						PreventTransactionChain(isTopLevel,
+-												"REINDEX DATABASE");
+-						ReindexDatabase(stmt->name,
+-										stmt->do_system, stmt->do_user);
++												(stmt->kind == REINDEX_OBJECT_SCHEMA) ?
++												"REINDEX SCHEMA" : "REINDEX DATABASE");
++						ReindexObject(stmt->name, stmt->kind);
+ 						break;
+ 					default:
+ 						elog(ERROR, "unrecognized object type: %d",
+diff --git a/src/bin/psql/tab-complete.c b/src/bin/psql/tab-complete.c
+index 7a509c1..82c926d 100644
+--- a/src/bin/psql/tab-complete.c
++++ b/src/bin/psql/tab-complete.c
+@@ -3331,7 +3331,7 @@ psql_completion(const char *text, int start, int end)
+ 	else if (pg_strcasecmp(prev_wd, "REINDEX") == 0)
+ 	{
+ 		static const char *const list_REINDEX[] =
+-		{"TABLE", "INDEX", "SYSTEM", "DATABASE", NULL};
++			{"TABLE", "INDEX", "SYSTEM", "SCHEMA", "DATABASE", NULL};
+ 
+ 		COMPLETE_WITH_LIST(list_REINDEX);
+ 	}
+@@ -3341,6 +3341,8 @@ psql_completion(const char *text, int start, int end)
+ 			COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_tm, NULL);
+ 		else if (pg_strcasecmp(prev_wd, "INDEX") == 0)
+ 			COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_indexes, NULL);
++		else if (pg_strcasecmp(prev_wd, "SCHEMA") == 0 )
++			COMPLETE_WITH_QUERY(Query_for_list_of_schemas);
+ 		else if (pg_strcasecmp(prev_wd, "SYSTEM") == 0 ||
+ 				 pg_strcasecmp(prev_wd, "DATABASE") == 0)
+ 			COMPLETE_WITH_QUERY(Query_for_list_of_databases);
+diff --git a/src/bin/scripts/reindexdb.c b/src/bin/scripts/reindexdb.c
+index 561bbce..5c4a64e 100644
+--- a/src/bin/scripts/reindexdb.c
++++ b/src/bin/scripts/reindexdb.c
+@@ -41,6 +41,7 @@ main(int argc, char *argv[])
+ 		{"password", no_argument, NULL, 'W'},
+ 		{"echo", no_argument, NULL, 'e'},
+ 		{"quiet", no_argument, NULL, 'q'},
++		{"schema", required_argument, NULL, 'S'},
+ 		{"dbname", required_argument, NULL, 'd'},
+ 		{"all", no_argument, NULL, 'a'},
+ 		{"system", no_argument, NULL, 's'},
+@@ -66,6 +67,7 @@ main(int argc, char *argv[])
+ 	bool		quiet = false;
+ 	SimpleStringList indexes = {NULL, NULL};
+ 	SimpleStringList tables = {NULL, NULL};
++	SimpleStringList schemas = {NULL, NULL};
+ 
+ 	progname = get_progname(argv[0]);
+ 	set_pglocale_pgservice(argv[0], PG_TEXTDOMAIN("pgscripts"));
+@@ -73,7 +75,7 @@ main(int argc, char *argv[])
+ 	handle_help_version_opts(argc, argv, "reindexdb", help);
+ 
+ 	/* process command-line options */
+-	while ((c = getopt_long(argc, argv, "h:p:U:wWeqd:ast:i:", long_options, &optindex)) != -1)
++	while ((c = getopt_long(argc, argv, "h:p:U:wWeqS:d:ast:i:", long_options, &optindex)) != -1)
+ 	{
+ 		switch (c)
+ 		{
+@@ -98,6 +100,9 @@ main(int argc, char *argv[])
+ 			case 'q':
+ 				quiet = true;
+ 				break;
++			case 'S':
++				simple_string_list_append(&schemas, optarg);
++				break;
+ 			case 'd':
+ 				dbname = pg_strdup(optarg);
+ 				break;
+@@ -154,6 +159,11 @@ main(int argc, char *argv[])
+ 			fprintf(stderr, _("%s: cannot reindex all databases and system catalogs at the same time\n"), progname);
+ 			exit(1);
+ 		}
++		if (schemas.head != NULL)
++		{
++			fprintf(stderr, _("%s: cannot reindex specific schema(s) in all databases\n"), progname);
++			exit(1);
++		}
+ 		if (tables.head != NULL)
+ 		{
+ 			fprintf(stderr, _("%s: cannot reindex specific table(s) in all databases\n"), progname);
+@@ -170,6 +180,11 @@ main(int argc, char *argv[])
+ 	}
+ 	else if (syscatalog)
+ 	{
++		if (schemas.head != NULL)
++		{
++			fprintf(stderr, _("%s: cannot reindex specific schema(s) and system catalogs at the same time\n"), progname);
++			exit(1);
++		}
+ 		if (tables.head != NULL)
+ 		{
+ 			fprintf(stderr, _("%s: cannot reindex specific table(s) and system catalogs at the same time\n"), progname);
+@@ -206,6 +221,17 @@ main(int argc, char *argv[])
+ 				dbname = get_user_name_or_exit(progname);
+ 		}
+ 
++		if (schemas.head != NULL)
++		{
++			SimpleStringListCell *cell;
++
++			for (cell = schemas.head; cell; cell = cell->next)
++			{
++				reindex_one_database(cell->val, dbname, "SCHEMA", host, port,
++								   username, prompt_password, progname, echo);
++			}
++		}
++
+ 		if (indexes.head != NULL)
+ 		{
+ 			SimpleStringListCell *cell;
+@@ -226,8 +252,8 @@ main(int argc, char *argv[])
+ 								  username, prompt_password, progname, echo);
+ 			}
+ 		}
+-		/* reindex database only if neither index nor table is specified */
+-		if (indexes.head == NULL && tables.head == NULL)
++		/* reindex database only if neither index nor table nor schema is specified */
++		if (indexes.head == NULL && tables.head == NULL && schemas.head == NULL)
+ 			reindex_one_database(dbname, dbname, "DATABASE", host, port,
+ 								 username, prompt_password, progname, echo);
+ 	}
+@@ -251,6 +277,8 @@ reindex_one_database(const char *name, const char *dbname, const char *type,
+ 		appendPQExpBuffer(&sql, " TABLE %s", name);
+ 	else if (strcmp(type, "INDEX") == 0)
+ 		appendPQExpBuffer(&sql, " INDEX %s", name);
++	else if (strcmp(type, "SCHEMA") == 0)
++		appendPQExpBuffer(&sql, " SCHEMA %s", name);
+ 	else if (strcmp(type, "DATABASE") == 0)
+ 		appendPQExpBuffer(&sql, " DATABASE %s", fmtId(name));
+ 	appendPQExpBufferStr(&sql, ";");
+@@ -266,6 +294,9 @@ reindex_one_database(const char *name, const char *dbname, const char *type,
+ 		if (strcmp(type, "INDEX") == 0)
+ 			fprintf(stderr, _("%s: reindexing of index \"%s\" in database \"%s\" failed: %s"),
+ 					progname, name, dbname, PQerrorMessage(conn));
++		if (strcmp(type, "SCHEMA") == 0)
++			fprintf(stderr, _("%s: reindexing of schema \"%s\" in database \"%s\" failed: %s"),
++					progname, name, dbname, PQerrorMessage(conn));
+ 		else
+ 			fprintf(stderr, _("%s: reindexing of database \"%s\" failed: %s"),
+ 					progname, dbname, PQerrorMessage(conn));
+@@ -348,6 +379,7 @@ help(const char *progname)
+ 	printf(_("  -i, --index=INDEX         recreate specific index(es) only\n"));
+ 	printf(_("  -q, --quiet               don't write any messages\n"));
+ 	printf(_("  -s, --system              reindex system catalogs\n"));
++	printf(_("  -S, --schema=SCHEMA       recreate specific schema(s) only\n"));
+ 	printf(_("  -t, --table=TABLE         reindex specific table(s) only\n"));
+ 	printf(_("  -V, --version             output version information, then exit\n"));
+ 	printf(_("  -?, --help                show this help, then exit\n"));
+diff --git a/src/bin/scripts/t/090_reindexdb.pl b/src/bin/scripts/t/090_reindexdb.pl
+index d5b42de..0cdf7be 100644
+--- a/src/bin/scripts/t/090_reindexdb.pl
++++ b/src/bin/scripts/t/090_reindexdb.pl
+@@ -1,7 +1,7 @@
+ use strict;
+ use warnings;
+ use TestLib;
+-use Test::More tests => 16;
++use Test::More tests => 17;
+ 
+ program_help_ok('reindexdb');
+ program_version_ok('reindexdb');
+@@ -27,7 +27,10 @@ issues_sql_like(
+ 	[ 'reindexdb', 'postgres', '-i', 'test1x' ],
+ 	qr/statement: REINDEX INDEX test1x;/,
+ 	'reindex specific index');
+-
++issues_sql_like(
++	[ 'reindexdb', 'postgres', '-S', 'pg_catalog' ],
++	qr/statement: REINDEX SCHEMA pg_catalog;/,
++	'reindex specific schema');
+ issues_sql_like(
+ 	[ 'reindexdb', 'postgres', '-s' ],
+ 	qr/statement: REINDEX SYSTEM postgres;/,
+diff --git a/src/include/commands/defrem.h b/src/include/commands/defrem.h
+index 0ebdbc1..f6210d3 100644
+--- a/src/include/commands/defrem.h
++++ b/src/include/commands/defrem.h
+@@ -30,8 +30,7 @@ extern Oid DefineIndex(Oid relationId,
+ 			bool quiet);
+ extern Oid	ReindexIndex(RangeVar *indexRelation);
+ extern Oid	ReindexTable(RangeVar *relation);
+-extern Oid ReindexDatabase(const char *databaseName,
+-				bool do_system, bool do_user);
++extern Oid ReindexObject(const char *databaseName, ReindexObjectType kind);
+ extern char *makeObjectName(const char *name1, const char *name2,
+ 			   const char *label);
+ extern char *ChooseRelationName(const char *name1, const char *name2,
+diff --git a/src/include/nodes/parsenodes.h b/src/include/nodes/parsenodes.h
+index 255415d..5eaa435 100644
+--- a/src/include/nodes/parsenodes.h
++++ b/src/include/nodes/parsenodes.h
+@@ -2721,10 +2721,19 @@ typedef struct ConstraintsSetStmt
+  *		REINDEX Statement
+  * ----------------------
+  */
++typedef enum ReindexObjectType
++{
++	REINDEX_OBJECT_INDEX,	/* index */
++	REINDEX_OBJECT_TABLE,	/* table or materialized view */
++	REINDEX_OBJECT_SCHEMA,	/* schema */
++	REINDEX_OBJECT_SYSTEM,	/* system catalogs */
++	REINDEX_OBJECT_DATABASE	/* database */
++} ReindexObjectType;
++
+ typedef struct ReindexStmt
+ {
+ 	NodeTag		type;
+-	ObjectType	kind;			/* OBJECT_INDEX, OBJECT_TABLE, etc. */
++	ReindexObjectType	kind;	/* REINDEX_OBJECT_INDEX, REINDEX_OBJECT_TABLE, etc. */
+ 	RangeVar   *relation;		/* Table or index to reindex */
+ 	const char *name;			/* name of database to reindex */
+ 	bool		do_system;		/* include system tables in database case */
+diff --git a/src/test/regress/expected/create_index.out b/src/test/regress/expected/create_index.out
+index 3ecb238..ebac939 100644
+--- a/src/test/regress/expected/create_index.out
++++ b/src/test/regress/expected/create_index.out
+@@ -2831,3 +2831,34 @@ explain (costs off)
+    Index Cond: ((thousand = 1) AND (tenthous = 1001))
+ (2 rows)
+ 
++--
++-- REINDEX SCHEMA
++--
++REINDEX SCHEMA schema_to_reindex; -- failure, schema does not exist
++ERROR:  schema "schema_to_reindex" does not exist
++CREATE SCHEMA schema_to_reindex;
++CREATE TABLE schema_to_reindex.table1(col1 SERIAL PRIMARY KEY);
++CREATE TABLE schema_to_reindex.table2(col1 SERIAL PRIMARY KEY, col2 VARCHAR(100) NOT NULL);
++CREATE INDEX ON schema_to_reindex.table2(col2);
++REINDEX SCHEMA schema_to_reindex;
++NOTICE:  table "schema_to_reindex.table1" was reindexed
++NOTICE:  table "schema_to_reindex.table2" was reindexed
++BEGIN;
++REINDEX SCHEMA schema_to_reindex; -- failure, cannot run in a transaction
++ERROR:  REINDEX SCHEMA cannot run inside a transaction block
++END;
++-- Failure for unauthorized user
++CREATE ROLE reindexuser login;
++SET SESSION ROLE user_reindex;
++ERROR:  role "user_reindex" does not exist
++REINDEX SCHEMA schema_to_reindex;
++NOTICE:  table "schema_to_reindex.table1" was reindexed
++NOTICE:  table "schema_to_reindex.table2" was reindexed
++-- Clean up
++RESET ROLE;
++DROP ROLE user_reindex;
++ERROR:  role "user_reindex" does not exist
++DROP SCHEMA schema_to_reindex CASCADE;
++NOTICE:  drop cascades to 2 other objects
++DETAIL:  drop cascades to table schema_to_reindex.table1
++drop cascades to table schema_to_reindex.table2
+diff --git a/src/test/regress/sql/create_index.sql b/src/test/regress/sql/create_index.sql
+index e837676..1cd57da 100644
+--- a/src/test/regress/sql/create_index.sql
++++ b/src/test/regress/sql/create_index.sql
+@@ -964,3 +964,26 @@ RESET enable_indexscan;
+ 
+ explain (costs off)
+   select * from tenk1 where (thousand, tenthous) in ((1,1001), (null,null));
++
++--
++-- REINDEX SCHEMA
++--
++REINDEX SCHEMA schema_to_reindex; -- failure, schema does not exist
++CREATE SCHEMA schema_to_reindex;
++CREATE TABLE schema_to_reindex.table1(col1 SERIAL PRIMARY KEY);
++CREATE TABLE schema_to_reindex.table2(col1 SERIAL PRIMARY KEY, col2 VARCHAR(100) NOT NULL);
++CREATE INDEX ON schema_to_reindex.table2(col2);
++REINDEX SCHEMA schema_to_reindex;
++BEGIN;
++REINDEX SCHEMA schema_to_reindex; -- failure, cannot run in a transaction
++END;
++
++-- Failure for unauthorized user
++CREATE ROLE reindexuser login;
++SET SESSION ROLE user_reindex;
++REINDEX SCHEMA schema_to_reindex;
++
++-- Clean up
++RESET ROLE;
++DROP ROLE user_reindex;
++DROP SCHEMA schema_to_reindex CASCADE;

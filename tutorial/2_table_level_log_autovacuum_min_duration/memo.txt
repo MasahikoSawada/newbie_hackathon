@@ -1,0 +1,23 @@
+v7.patchでVERBOSEオプションについての議論。
+ DROP TABLE t1;
+ CREATE TABLE t1(id integer primary key,name text);
+ ALTER TABLE t1 SET (log_autovacuum_min_duration=0);
+ ALTER TABLE t1 ALTER COLUMN name SET STORAGE EXTERNAL;
+ INSERT INTO t1 SELECT GENERATE_SERIES(1,100),repeat('a',3000);
+ UPDATE t1 SET name='update';
+をの後のautovacuumの出力がおかしい。
+I think VACOPT_VERBOSE should not be easily replaced to log_min_duration>=0.
+というコメントもあり。
+
+また、以下のコメントはバグを指摘したコメント。
+And, in this v7 patch looks that VERBOSE log is always output 
+in INFO-Level when log_autovacuum_min_duration is set to 0. 
+Is this your point?
+
+v8パッチでも以下のコメントあり。
+With the patch, VACUUM ANALYZE VERBOSE doesn't emit any verbose message.
+Why did you remove that functionality?
+autovacuumだけでなくて、手動VACUUMでもちゃんとレビューをしなくては行けない。
+
+
+	

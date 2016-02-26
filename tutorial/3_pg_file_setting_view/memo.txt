@@ -1,0 +1,50 @@
+v1パッチに対しては以下のコメントあり。
+Is there a reason not to have the sourcefile as a column in
+pg_settings?
+
+This would default to being available to superusers only, right?  Details
+of the file system shouldn't be available to any random user.​
+
+v1は主にデザインレビューができる。
+
+==
+v3ではコードでイケてない点が幾つかあり、またREVOKEも忘れている。
+
+==
+v5ではいかのコメントあり。
+
+There's an issue freeing these when calling pg_reload_conf():
+
+postgres=# alter system set max_connections = 100;
+ALTER SYSTEM
+postgres=# select * from pg_reload_conf();
+LOG:  received SIGHUP, reloading configuration files
+ pg_reload_conf
+----------------
+ t
+(1 row)
+
+postgres=# postgres(25078,0x7fff747b2300) malloc: *** error for object
+0x424d380044: pointer being freed was not allocated
+*** set a breakpoint in malloc_error_break to debug
+
+Of course a config reload can't change max_connections, but I wouldn't
+expect it to crash, either.
+
++            guc_array->sourceline = -1;
+
+I can't see the need for this since it is reassigned further down.
+
+
+Personally I think it would be fine to start from 1 and increment for
+each setting found, rather than rank within a setting.  If the user
+wants per setting ranking that's what SQL is for.  So the output would
+look something like:
+
+バグとデザインの修正あり。
+
+==
+v7では、whitespaceのバグあり。
+またinstallcheck-worldが通らない。
+
+==
